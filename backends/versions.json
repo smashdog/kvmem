@@ -6,7 +6,7 @@
     "base_commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab",
     "license_file": "backends/llamacpp/LICENSE",
     "local_changes": "Ordered local patches over the pinned upstream; verify every patch and the complete prepared tree.",
-    "patched_tree": "923086f011e015fef9515124ef64a189e940c0b1",
+    "patched_tree": "6e339ca4392a35bc144632314739980cdc424f4e",
     "patches": [
       {
         "id": "kvmem",
@@ -53,6 +53,16 @@
         "requires": [
           "ptq1-performance"
         ]
+      },
+      {
+        "id": "ui-stream-visibility",
+        "path": "backends/patches/llamacpp-ui-stream-visibility.patch",
+        "sha256": "c67707901a2ac2f6c2e9dbba202360104cbe58f2ead8fd661ff8bbdc99c85329",
+        "requires": [
+          "checkpoint-policy"
+        ],
+        "after_tree": "6e339ca4392a35bc144632314739980cdc424f4e",
+        "source": "Chat UI: defer the visibilitychange reader kick by a grace window so a healthy but throttled stream is not cancelled when the tab returns to the foreground (fixes long-prompt prefill abort and the failed /v1/stream resume on backends without replay); adds a node unit regression test"
       }
     ]
   },

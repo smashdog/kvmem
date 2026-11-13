@@ -1,0 +1,207 @@
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index b008b16db8..41fd7d4408 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -536,10 +536,22 @@ export class ChatService {
+ 
+ 			if (!conversationId) return;
+ 
+-			// the bytes have been quiet for too long, the OS likely killed the socket
+-			// kicking the reader unblocks reader.read with done=true so the outer loop can resume
++			// The tab just returned to the foreground. While it was hidden the page is
++			// throttled, so lastByteAt can be stale even though the socket is healthy and
++			// buffered bytes are waiting to drain. Cancelling here would close a live POST
++			// connection, abort the engine prefill (peer-gone) and fail the /v1/stream resume
++			// on backends without replay. Give the read loop a grace window to refresh
++			// lastByteAt; only kick the reader if the stream is still silent afterwards.
+ 			if (Date.now() - lastByteAt > STREAM_VISIBILITY_KICK_MS) {
+-				reader!.cancel().catch(() => {});
++				const visibleAt = Date.now();
++				setTimeout(() => {
++					if (streamFinished || abortSignal?.aborted) return;
++					// bytes flowed since we returned to the foreground -> socket is alive
++					if (lastByteAt >= visibleAt) return;
++					if (Date.now() - lastByteAt > STREAM_VISIBILITY_KICK_MS) {
++						reader!.cancel().catch(() => {});
++					}
++				}, STREAM_VISIBILITY_KICK_MS);
+ 			}
+ 		};
+ 		const onPageHide = () => {
+diff --git a/tools/ui/tests/unit/stream-visibility-kick.test.ts b/tools/ui/tests/unit/stream-visibility-kick.test.ts
+new file mode 100644
+index 0000000000..076bb202a7
+--- /dev/null
++++ b/tools/ui/tests/unit/stream-visibility-kick.test.ts
+@@ -0,0 +1,170 @@
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++
++// node env unit project has no DOM; install a minimal localStorage backed by a Map
++beforeAll(() => {
++	const store = new Map<string, string>();
++	const polyfill: Storage = {
++		clear: () => store.clear(),
++		getItem: (k) => (store.has(k) ? store.get(k)! : null),
++		key: (i) => Array.from(store.keys())[i] ?? null,
++		get length() {
++			return store.size;
++		},
++		removeItem: (k) => store.delete(k),
++		setItem: (k, v) => store.set(k, String(v))
++	};
++
++	(globalThis as unknown as { localStorage: Storage }).localStorage = polyfill;
++});
++
++import { STREAM_VISIBILITY_KICK_MS } from '$lib/constants';
++import { ChatService } from '$lib/services/chat.service';
++
++/**
++ * Regression for the long-prompt UI abort: returning to a foregrounded tab must not
++ * cancel a healthy SSE stream. While the tab is hidden the page is throttled, so the
++ * read loop's lastByteAt goes stale even though the socket is alive and buffered bytes
++ * are waiting. The visibility kick used to cancel the reader immediately on return,
++ * which closed the POST connection, made the engine abort the prefill (peer-gone) and
++ * then fail the /v1/stream resume (the kvmem backend does not implement replay).
++ */
++describe('ChatService stream visibility kick', () => {
++	type Listener = () => void;
++	let docListeners: Record<string, Listener[]>;
++	let doc: {
++		visibilityState: string;
++		addEventListener: (e: string, f: Listener) => void;
++		removeEventListener: (e: string, f: Listener) => void;
++	};
++	let controller: ReadableStreamDefaultController<Uint8Array>;
++	let reader: ReadableStreamDefaultReader<Uint8Array>;
++	let cancelSpy: ReturnType<typeof vi.spyOn>;
++	let response: Response;
++	const encoder = new TextEncoder();
++
++	const fireVisibility = (state: string) => {
++		doc.visibilityState = state;
++		for (const fn of docListeners['visibilitychange'] ?? []) fn();
++	};
++	const send = async (s: string) => {
++		controller.enqueue(encoder.encode(s));
++		await vi.advanceTimersByTimeAsync(0);
++	};
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
++		localStorage.clear();
++
++		docListeners = {};
++		doc = {
++			visibilityState: 'visible',
++			addEventListener: (e, f) => {
++				(docListeners[e] ??= []).push(f);
++			},
++			removeEventListener: (e, f) => {
++				docListeners[e] = (docListeners[e] ?? []).filter((fn) => fn !== f);
++			}
++		};
++		(globalThis as unknown as { document: unknown }).document = doc;
++		(globalThis as unknown as { window: unknown }).window = {
++			addEventListener: () => {},
++			removeEventListener: () => {}
++		};
++
++		// the kvmem backend has no /v1/stream replay route: a resume always 404s
++		vi.stubGlobal(
++			'fetch',
++			vi.fn(async () => ({ ok: false, status: 404 }) as unknown as Response)
++		);
++
++		const stream = new ReadableStream<Uint8Array>({
++			start(c) {
++				controller = c;
++			}
++		});
++		reader = stream.getReader();
++		cancelSpy = vi.spyOn(reader, 'cancel');
++		response = { body: { getReader: () => reader } } as unknown as Response;
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.unstubAllGlobals();
++		delete (globalThis as unknown as { document?: unknown }).document;
++		delete (globalThis as unknown as { window?: unknown }).window;
++		localStorage.clear();
++	});
++
++	it('does not cancel a healthy stream that resumes bytes after the tab returns to foreground', async () => {
++		const onComplete = vi.fn();
++		const onError = vi.fn();
++
++		const finished = ChatService.handleStreamResponse(
++			response,
++			undefined,
++			onComplete,
++			onError,
++			undefined,
++			undefined,
++			undefined,
++			undefined,
++			undefined,
++			'conv-vis-healthy'
++		);
++
++		// bytes flow normally, lastByteAt is fresh
++		await send('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n');
++
++		// tab goes to background; the page is throttled and no bytes are processed
++		fireVisibility('hidden');
++		await vi.advanceTimersByTimeAsync(STREAM_VISIBILITY_KICK_MS + 500);
++
++		// tab returns to foreground: lastByteAt is stale, but the socket is healthy.
++		// the kick must not fire synchronously on the stale hidden-tab timestamp
++		fireVisibility('visible');
++		expect(cancelSpy).not.toHaveBeenCalled();
++
++		// the healthy stream drains its buffered bytes shortly after returning
++		await send('data: {"choices":[{"delta":{"content":" world"}}]}\n\n');
++		await vi.advanceTimersByTimeAsync(STREAM_VISIBILITY_KICK_MS + 500);
++
++		expect(cancelSpy).not.toHaveBeenCalled();
++		expect(onError).not.toHaveBeenCalled();
++
++		// the stream completes normally
++		await send('data: [DONE]\n\n');
++		await finished;
++
++		expect(onComplete).toHaveBeenCalled();
++		expect(cancelSpy).not.toHaveBeenCalled();
++	});
++
++	it('still kicks a reader whose socket stays silent after the grace window (genuine dead socket)', async () => {
++		const onError = vi.fn();
++
++		void ChatService.handleStreamResponse(
++			response,
++			undefined,
++			undefined,
++			onError,
++			undefined,
++			undefined,
++			undefined,
++			undefined,
++			undefined,
++			'conv-vis-dead'
++		);
++
++		await send('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
++
++		fireVisibility('hidden');
++		await vi.advanceTimersByTimeAsync(STREAM_VISIBILITY_KICK_MS + 500);
++		fireVisibility('visible');
++
++		// no bytes ever arrive: after the grace window the reader is kicked to trigger resume
++		await vi.advanceTimersByTimeAsync(STREAM_VISIBILITY_KICK_MS + 500);
++
++		expect(cancelSpy).toHaveBeenCalled();
++	});
++});
+\ No newline at end of file
